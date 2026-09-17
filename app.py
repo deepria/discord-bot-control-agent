@@ -1,14 +1,21 @@
-from fastapi import FastAPI, HTTPException, Header
-import subprocess
-import psutil
-import os
-import time
+import asyncio
 import hmac
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import psutil
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Rio Agent")
 
 SERVICE = "rio-bot.service"
 TOKEN = os.environ["RIO_AGENT_TOKEN"]
+EVENT_LOG_PATH = Path(os.getenv("RIO_EVENT_LOG_PATH", "/opt/rio-discord-bot/data/logs/events.jsonl"))
+STATUS_PATH = Path(os.getenv("RIO_STATUS_PATH", "/opt/rio-discord-bot/data/logs/status.json"))
 
 
 def run(cmd: list[str]):
@@ -22,6 +29,30 @@ def run(cmd: list[str]):
 def verify_token(authorization: str | None):
     if not authorization:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def read_status() -> dict | None:
+    try:
+        value = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def read_events(lines: int) -> list[dict]:
+    try:
+        rows = EVENT_LOG_PATH.read_text(encoding="utf-8").splitlines()[-lines:]
+    except OSError:
+        return []
+    events = []
+    for row in rows:
+        try:
+            value = json.loads(row)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    return events
 
     expected = f"Bearer {TOKEN}"
 
@@ -91,7 +122,8 @@ def status(authorization: str | None = Header(default=None)):
         "pid": pid,
         "memory_mb": memory_mb,
         "cpu_percent": cpu_percent,
-        "uptime_seconds": uptime_seconds
+        "uptime_seconds": uptime_seconds,
+        "runtime": read_status(),
     }
 
 
@@ -118,6 +150,15 @@ def logs(
     return {
         "logs": result.stdout.splitlines()
     }
+
+
+@app.get("/events")
+def events(
+    lines: int = 100,
+    authorization: str | None = Header(default=None),
+):
+    verify_token(authorization)
+    return {"events": read_events(max(1, min(lines, 500)))}
 
 
 @app.post("/bot/start")
@@ -173,53 +214,8 @@ def bot_restart(authorization: str | None = Header(default=None)):
         "action": "restart"
     }
 
-from fastapi.responses import StreamingResponse
-import asyncio
-
-
 @app.get("/logs/stream")
 async def logs_stream(authorization: str | None = Header(default=None)):
-    verify_token(authorization)
-
-    async def event_generator():
-        process = await asyncio.create_subprocess_exec(
-            "journalctl",
-            "-u",
-            SERVICE,
-            "-f",
-            "-n",
-            "20",
-            "-o",
-            "short-iso",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        try:
-            while True:
-                line = await process.stdout.readline()
-
-                if not line:
-                    break
-
-                text = line.decode(errors="replace").rstrip()
-                yield f"data: {text}\n\n"
-
-        finally:
-            if process.returncode is None:
-                process.terminate()
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream"
-    )
-
-
-@app.get("/logs/stream")
-async def logs_stream(authorization: str | None = Header(default=None)):
-    import asyncio
-    from fastapi.responses import StreamingResponse
-
     verify_token(authorization)
 
     async def event_generator():
