@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
@@ -16,6 +17,8 @@ SERVICE = "rio-bot.service"
 TOKEN = os.environ["RIO_AGENT_TOKEN"]
 EVENT_LOG_PATH = Path(os.getenv("RIO_EVENT_LOG_PATH", "/opt/rio-discord-bot/data/logs/events.jsonl"))
 STATUS_PATH = Path(os.getenv("RIO_STATUS_PATH", "/opt/rio-discord-bot/data/logs/status.json"))
+BOT_REPO = Path(os.getenv("RIO_BOT_REPO", "/opt/rio-discord-bot"))
+AGENT_REPO = Path(os.getenv("RIO_AGENT_REPO", "/opt/rio-agent"))
 
 
 def run(cmd: list[str]):
@@ -28,6 +31,10 @@ def run(cmd: list[str]):
 
 def verify_token(authorization: str | None):
     if not authorization:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    expected = f"Bearer {TOKEN}"
+    if not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -54,10 +61,45 @@ def read_events(lines: int) -> list[dict]:
             events.append(value)
     return events
 
-    expected = f"Bearer {TOKEN}"
 
-    if not hmac.compare_digest(authorization, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def command_value(cmd: list[str]) -> str:
+    result = run(cmd)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def systemd_properties(unit: str, properties: list[str]) -> dict[str, str]:
+    result = run(["systemctl", "show", unit, *[f"--property={name}" for name in properties]])
+    values = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    return values
+
+
+def deployment_status(name: str, repo: Path, service: str, timer: str) -> dict:
+    revision = command_value(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"])
+    remote_revision = command_value(
+        ["git", "-C", str(repo), "rev-parse", "--short", "origin/main"]
+    )
+    dirty = bool(command_value(["git", "-C", str(repo), "status", "--porcelain"]))
+    service_state = systemd_properties(
+        service,
+        ["ActiveState", "SubState", "Result", "ExecMainStatus", "ExecMainExitTimestamp"],
+    )
+    timer_state = systemd_properties(
+        timer,
+        ["ActiveState", "NextElapseUSecRealtime", "LastTriggerUSec"],
+    )
+    return {
+        "component": name,
+        "revision": revision or None,
+        "remote_revision": remote_revision or None,
+        "update_available": bool(revision and remote_revision and revision != remote_revision),
+        "working_tree_dirty": dirty,
+        "service": service_state,
+        "timer": timer_state,
+    }
 
 
 @app.get("/health")
@@ -159,6 +201,20 @@ def events(
 ):
     verify_token(authorization)
     return {"events": read_events(max(1, min(lines, 500)))}
+
+
+@app.get("/deployments")
+def deployments(authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "deployments": [
+            deployment_status("bot", BOT_REPO, "rio-bot-deploy.service", "rio-bot-deploy.timer"),
+            deployment_status(
+                "agent", AGENT_REPO, "rio-agent-deploy.service", "rio-agent-deploy.timer"
+            ),
+        ],
+    }
 
 
 @app.post("/bot/start")
