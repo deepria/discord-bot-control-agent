@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import json
+import math
 import os
 import subprocess
 import time
@@ -38,12 +39,23 @@ def verify_token(authorization: str | None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def json_safe(value):
+    """Convert persisted runtime data into strict JSON-compatible values."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
 def read_status() -> dict | None:
     try:
         value = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return value if isinstance(value, dict) else None
+    return json_safe(value) if isinstance(value, dict) else None
 
 
 def read_events(lines: int) -> list[dict]:
@@ -58,7 +70,7 @@ def read_events(lines: int) -> list[dict]:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            events.append(value)
+            events.append(json_safe(value))
     return events
 
 
