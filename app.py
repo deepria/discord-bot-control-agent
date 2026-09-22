@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Rio Agent")
@@ -152,6 +152,43 @@ def read_runtime_settings() -> dict:
     return payload
 
 
+def read_runtime_config_audit_events(limit: int) -> dict:
+    """Ask the bot package for a content-free, read-only audit snapshot."""
+    script = (
+        "import json; "
+        "from rio_bot.core.config import Settings; "
+        "from rio_bot.core.runtime_settings_snapshot import runtime_config_audit_snapshot; "
+        f"print(json.dumps({{'events': runtime_config_audit_snapshot(Settings.load(), limit={limit})}}, "
+        "ensure_ascii=False))"
+    )
+    environment = os.environ.copy()
+    source_root = str(BOT_REPO / "src")
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
+    )
+    try:
+        result = subprocess.run(
+            [BOT_PYTHON, "-c", script],
+            capture_output=True,
+            cwd=BOT_REPO,
+            env=environment,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail="Runtime audit is unavailable") from exc
+    if result.returncode != 0:
+        raise HTTPException(status_code=503, detail="Runtime audit is unavailable")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="Runtime audit is unavailable") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+        raise HTTPException(status_code=503, detail="Runtime audit is unavailable")
+    return payload
+
+
 @app.get("/health")
 def health(authorization: str | None = Header(default=None)):
     verify_token(authorization)
@@ -223,6 +260,15 @@ def status(authorization: str | None = Header(default=None)):
 def runtime_settings(authorization: str | None = Header(default=None)):
     verify_token(authorization)
     return read_runtime_settings()
+
+
+@app.get("/settings/audit-events")
+def runtime_config_audit_events(
+    limit: int = Query(default=50, ge=1, le=100),
+    authorization: str | None = Header(default=None),
+):
+    verify_token(authorization)
+    return read_runtime_config_audit_events(limit)
 
 
 @app.get("/logs")
