@@ -20,6 +20,7 @@ EVENT_LOG_PATH = Path(os.getenv("RIO_EVENT_LOG_PATH", "/opt/rio-discord-bot/data
 STATUS_PATH = Path(os.getenv("RIO_STATUS_PATH", "/opt/rio-discord-bot/data/logs/status.json"))
 BOT_REPO = Path(os.getenv("RIO_BOT_REPO", "/opt/rio-discord-bot"))
 AGENT_REPO = Path(os.getenv("RIO_AGENT_REPO", "/opt/rio-agent"))
+BOT_PYTHON = os.getenv("RIO_BOT_PYTHON", str(BOT_REPO / ".venv" / "bin" / "python"))
 
 
 def run(cmd: list[str]):
@@ -114,6 +115,43 @@ def deployment_status(name: str, repo: Path, service: str, timer: str) -> dict:
     }
 
 
+def read_runtime_settings() -> dict:
+    """Ask the bot package for a read-only, display-safe settings snapshot."""
+    script = (
+        "import json; "
+        "from rio_bot.core.config import Settings; "
+        "from rio_bot.core.runtime_settings_snapshot import runtime_settings_snapshot; "
+        "print(json.dumps({'settings': runtime_settings_snapshot(Settings.load())}, "
+        "ensure_ascii=False))"
+    )
+    environment = os.environ.copy()
+    source_root = str(BOT_REPO / "src")
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
+    )
+    try:
+        result = subprocess.run(
+            [BOT_PYTHON, "-c", script],
+            capture_output=True,
+            cwd=BOT_REPO,
+            env=environment,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable") from exc
+    if result.returncode != 0:
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("settings"), list):
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable")
+    return payload
+
+
 @app.get("/health")
 def health(authorization: str | None = Header(default=None)):
     verify_token(authorization)
@@ -179,6 +217,12 @@ def status(authorization: str | None = Header(default=None)):
         "uptime_seconds": uptime_seconds,
         "runtime": read_status(),
     }
+
+
+@app.get("/settings/runtime")
+def runtime_settings(authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    return read_runtime_settings()
 
 
 @app.get("/logs")
