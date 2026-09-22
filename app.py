@@ -10,6 +10,7 @@ from pathlib import Path
 
 import psutil
 from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Rio Agent")
@@ -21,6 +22,10 @@ STATUS_PATH = Path(os.getenv("RIO_STATUS_PATH", "/opt/rio-discord-bot/data/logs/
 BOT_REPO = Path(os.getenv("RIO_BOT_REPO", "/opt/rio-discord-bot"))
 AGENT_REPO = Path(os.getenv("RIO_AGENT_REPO", "/opt/rio-agent"))
 BOT_PYTHON = os.getenv("RIO_BOT_PYTHON", str(BOT_REPO / ".venv" / "bin" / "python"))
+
+
+class DiscordIdentity(BaseModel):
+    user_id: str
 
 
 def run(cmd: list[str]):
@@ -189,6 +194,44 @@ def read_runtime_config_audit_events(limit: int) -> dict:
     return payload
 
 
+def discord_console_role(user_id: str) -> str:
+    """Resolve a Discord identity against the Bot's current admin configuration."""
+    if not user_id.isdigit() or len(user_id) > 30:
+        raise HTTPException(status_code=400, detail="Invalid Discord identity")
+    script = (
+        "import json; "
+        "from rio_bot.core.config import Settings; "
+        "print(json.dumps({'bot_admin_ids': [str(item) for item in Settings.load().bot_admin_ids]}))"
+    )
+    environment = os.environ.copy()
+    source_root = str(BOT_REPO / "src")
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
+    )
+    try:
+        result = subprocess.run(
+            [BOT_PYTHON, "-c", script],
+            capture_output=True,
+            cwd=BOT_REPO,
+            env=environment,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail="Authorization is unavailable") from exc
+    if result.returncode != 0:
+        raise HTTPException(status_code=503, detail="Authorization is unavailable")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="Authorization is unavailable") from exc
+    admin_ids = payload.get("bot_admin_ids") if isinstance(payload, dict) else None
+    if not isinstance(admin_ids, list) or not all(isinstance(item, str) for item in admin_ids):
+        raise HTTPException(status_code=503, detail="Authorization is unavailable")
+    return "admin" if user_id in admin_ids else "viewer"
+
+
 @app.get("/health")
 def health(authorization: str | None = Header(default=None)):
     verify_token(authorization)
@@ -260,6 +303,16 @@ def status(authorization: str | None = Header(default=None)):
 def runtime_settings(authorization: str | None = Header(default=None)):
     verify_token(authorization)
     return read_runtime_settings()
+
+
+@app.post("/auth/discord-user")
+def authorize_discord_user(
+    identity: DiscordIdentity, authorization: str | None = Header(default=None)
+):
+    verify_token(authorization)
+    if not identity.user_id.isdigit() or len(identity.user_id) > 30:
+        raise HTTPException(status_code=400, detail="Invalid Discord identity")
+    return {"id": identity.user_id, "role": discord_console_role(identity.user_id)}
 
 
 @app.get("/settings/audit-events")
