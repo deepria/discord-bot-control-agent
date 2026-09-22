@@ -7,6 +7,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 import psutil
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -26,6 +27,17 @@ BOT_PYTHON = os.getenv("RIO_BOT_PYTHON", str(BOT_REPO / ".venv" / "bin" / "pytho
 
 class DiscordIdentity(BaseModel):
     user_id: str
+
+
+class RuntimeSettingWrite(BaseModel):
+    value: str
+    request_id: UUID
+    actor_id: str
+
+
+class RuntimeSettingReset(BaseModel):
+    request_id: UUID
+    actor_id: str
 
 
 def run(cmd: list[str]):
@@ -194,6 +206,69 @@ def read_runtime_config_audit_events(limit: int) -> dict:
     return payload
 
 
+def write_runtime_setting(
+    *, key: str, value: str | None, actor_id: str, request_id: str
+) -> dict:
+    """Invoke the Bot-owned write service; values never enter agent logs or audit rows."""
+    script = """
+import json, sys
+from rio_bot.core.config import Settings
+from rio_bot.core.store import Store
+from rio_bot.core.runtime_config import RUNTIME_SETTING_SPECS, RuntimeConfigAudit, RuntimeSettings, runtime_setting_attr
+from rio_bot.core.runtime_settings_service import apply_runtime_setting
+base = Settings.load()
+store = Store(base.db_path, base.history_turns)
+try:
+    result = apply_runtime_setting(
+        RuntimeSettings(base, store), key=sys.argv[1], value=None if sys.argv[2] == "__RESET__" else sys.argv[2],
+        actor_kind="console", actor_id=sys.argv[3], request_id=sys.argv[4],
+    )
+    print(json.dumps({"ok": True, "setting": result}, ensure_ascii=False))
+except ValueError as exc:
+    try:
+        attr = runtime_setting_attr(sys.argv[1])
+        if not any(row["request_id"] == sys.argv[4] for row in settings.audit_rows()):
+            settings.record_audit(RuntimeConfigAudit(
+                actor_kind="console", actor_id=sys.argv[3],
+                action="runtime_config.set" if sys.argv[2] != "__RESET__" else "runtime_config.reset",
+                target=RUNTIME_SETTING_SPECS[attr].env_name, outcome="failure", request_id=sys.argv[4],
+            ))
+    except ValueError:
+        pass
+    print(json.dumps({"ok": False, "detail": str(exc)}, ensure_ascii=False))
+finally:
+    store.close()
+"""
+    environment = os.environ.copy()
+    source_root = str(BOT_REPO / "src")
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
+    )
+    try:
+        result = subprocess.run(
+            [BOT_PYTHON, "-c", script, key, value if value is not None else "__RESET__", actor_id, request_id],
+            capture_output=True, cwd=BOT_REPO, env=environment, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable") from exc
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable") from exc
+    if result.returncode != 0 or not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable")
+    if payload.get("ok") is False:
+        detail = payload.get("detail")
+        raise HTTPException(
+            status_code=400,
+            detail=detail if isinstance(detail, str) and len(detail) <= 300 else "Invalid runtime setting",
+        )
+    if not isinstance(payload.get("setting"), dict):
+        raise HTTPException(status_code=503, detail="Runtime settings are unavailable")
+    return payload["setting"]
+
+
 def discord_console_role(user_id: str) -> str:
     """Resolve a Discord identity against the Bot's current admin configuration."""
     if not user_id.isdigit() or len(user_id) > 30:
@@ -303,6 +378,33 @@ def status(authorization: str | None = Header(default=None)):
 def runtime_settings(authorization: str | None = Header(default=None)):
     verify_token(authorization)
     return read_runtime_settings()
+
+
+def require_console_admin(actor_id: str) -> None:
+    if discord_console_role(actor_id) != "admin":
+        raise HTTPException(status_code=403, detail="Discord bot administrator access is required")
+
+
+@app.put("/settings/runtime/{key}")
+def set_runtime_setting(
+    key: str, write: RuntimeSettingWrite, authorization: str | None = Header(default=None)
+):
+    verify_token(authorization)
+    require_console_admin(write.actor_id)
+    return write_runtime_setting(
+        key=key, value=write.value, actor_id=write.actor_id, request_id=str(write.request_id)
+    )
+
+
+@app.delete("/settings/runtime/{key}")
+def reset_runtime_setting(
+    key: str, reset: RuntimeSettingReset, authorization: str | None = Header(default=None)
+):
+    verify_token(authorization)
+    require_console_admin(reset.actor_id)
+    return write_runtime_setting(
+        key=key, value=None, actor_id=reset.actor_id, request_id=str(reset.request_id)
+    )
 
 
 @app.post("/auth/discord-user")
