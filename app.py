@@ -169,6 +169,27 @@ def read_runtime_settings() -> dict:
     return payload
 
 
+def read_policy_snapshot() -> dict:
+    script = (
+        "import json; "
+        "from rio_bot.core.config import Settings; "
+        "from rio_bot.core.runtime_settings_snapshot import policy_snapshot; "
+        "print(json.dumps({'policies': policy_snapshot(Settings.load())}, ensure_ascii=False))"
+    )
+    environment = os.environ.copy()
+    source_root = str(BOT_REPO / "src")
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
+    try:
+        result = subprocess.run([BOT_PYTHON, "-c", script], capture_output=True, cwd=BOT_REPO, env=environment, text=True, timeout=10)
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="Policy settings are unavailable") from exc
+    if result.returncode != 0 or not isinstance(payload, dict) or not isinstance(payload.get("policies"), list):
+        raise HTTPException(status_code=503, detail="Policy settings are unavailable")
+    return payload
+
+
 def read_runtime_config_audit_events(limit: int) -> dict:
     """Ask the bot package for a content-free, read-only audit snapshot."""
     script = (
@@ -378,6 +399,12 @@ def status(authorization: str | None = Header(default=None)):
 def runtime_settings(authorization: str | None = Header(default=None)):
     verify_token(authorization)
     return read_runtime_settings()
+
+
+@app.get("/settings/policies")
+def policies(authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    return read_policy_snapshot()
 
 
 def require_console_admin(actor_id: str) -> None:
