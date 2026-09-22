@@ -40,6 +40,12 @@ class RuntimeSettingReset(BaseModel):
     actor_id: str
 
 
+class PolicyWrite(BaseModel):
+    value: str
+    request_id: UUID
+    actor_id: str
+
+
 def run(cmd: list[str]):
     return subprocess.run(
         cmd,
@@ -290,6 +296,39 @@ finally:
     return payload["setting"]
 
 
+def write_policy_setting(*, policy: str, scope: str, value: str, actor_id: str, request_id: str) -> dict:
+    script = """
+import json, sys
+from rio_bot.core.config import Settings
+from rio_bot.core.store import Store
+from rio_bot.core.policy_settings_service import set_policy_override
+base = Settings.load()
+store = Store(base.db_path, base.history_turns)
+try:
+    result = set_policy_override(store, policy=sys.argv[1], scope=sys.argv[2], value=sys.argv[3], actor_kind='console', actor_id=sys.argv[4], request_id=sys.argv[5])
+    print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
+except ValueError as exc:
+    print(json.dumps({'ok': False, 'detail': str(exc)}, ensure_ascii=False))
+finally:
+    store.close()
+"""
+    environment = os.environ.copy()
+    source_root = str(BOT_REPO / "src")
+    environment["PYTHONPATH"] = source_root if not environment.get("PYTHONPATH") else f"{source_root}{os.pathsep}{environment['PYTHONPATH']}"
+    try:
+        result = subprocess.run([BOT_PYTHON, "-c", script, policy, scope, value, actor_id, request_id], capture_output=True, cwd=BOT_REPO, env=environment, text=True, timeout=10)
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="Policy settings are unavailable") from exc
+    if result.returncode != 0 or not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="Policy settings are unavailable")
+    if payload.get("ok") is False:
+        raise HTTPException(status_code=400, detail=str(payload.get("detail", "Invalid policy setting"))[:300])
+    if not isinstance(payload.get("result"), dict):
+        raise HTTPException(status_code=503, detail="Policy settings are unavailable")
+    return payload["result"]
+
+
 def discord_console_role(user_id: str) -> str:
     """Resolve a Discord identity against the Bot's current admin configuration."""
     if not user_id.isdigit() or len(user_id) > 30:
@@ -405,6 +444,13 @@ def runtime_settings(authorization: str | None = Header(default=None)):
 def policies(authorization: str | None = Header(default=None)):
     verify_token(authorization)
     return read_policy_snapshot()
+
+
+@app.put("/settings/policies/{policy}/{scope:path}")
+def set_policy_setting(policy: str, scope: str, write: PolicyWrite, authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    require_console_admin(write.actor_id)
+    return write_policy_setting(policy=policy, scope=scope, value=write.value, actor_id=write.actor_id, request_id=str(write.request_id))
 
 
 def require_console_admin(actor_id: str) -> None:
