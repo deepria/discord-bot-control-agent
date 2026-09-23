@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -7,7 +8,6 @@ os.environ.setdefault("RIO_AGENT_TOKEN", "test-token")
 from fastapi.testclient import TestClient
 
 import app as app_module
-
 
 client = TestClient(app_module.app)
 HEADERS = {"Authorization": "Bearer test-token"}
@@ -171,3 +171,43 @@ def test_memory_reader_uses_read_only_sqlite_metadata(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert response.json()["memory"][0]["kind"] == "fact"
     assert "content" not in response.text
+
+
+def test_traces_support_period_and_opaque_cursor(monkeypatch, tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_text("\n".join(json.dumps({
+        "at": f"2026-09-23T00:0{index}:00Z", "event": "turn.completed",
+        "turn_id": f"00000000-0000-0000-0000-00000000000{index}",
+    }) for index in range(3)) + "\n", encoding="utf-8")
+    monkeypatch.setattr(app_module, "EVENT_LOG_PATH", path)
+
+    response = client.get("/traces?from=2026-09-23T00:00:00Z&to=2026-09-23T00:02:00Z&limit=2", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert [row["turn_id"][-1] for row in response.json()["traces"]] == ["2", "1"]
+    cursor = response.json()["next_cursor"]
+    next_page = client.get(f"/traces?limit=2&cursor={cursor}", headers=HEADERS)
+    assert [row["turn_id"][-1] for row in next_page.json()["traces"]] == ["0"]
+
+
+def test_memory_detail_requires_signed_admin_identity_and_audits(monkeypatch, tmp_path):
+    database = tmp_path / "rio.sqlite3"
+    connection = __import__("sqlite3").connect(database)
+    connection.execute("CREATE TABLE structured_memory_items (id INTEGER, owner_id TEXT, origin_realm TEXT, origin_channel_id TEXT, kind TEXT, disclosure TEXT, confidence REAL, created_at TEXT, content TEXT)")
+    connection.execute("INSERT INTO structured_memory_items VALUES (1, 'u', 'r', 'c', 'fact', 'owner_private', .8, '2026-09-23', 'secret')")
+    connection.commit()
+    connection.close()
+    audit_path = tmp_path / "memory-access.jsonl"
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    secret = "identity-test-secret"
+    signature = hmac.new(secret.encode(), f"42.{timestamp}".encode(), "sha256").hexdigest()
+    monkeypatch.setattr(app_module, "BOT_DB_PATH", database)
+    monkeypatch.setattr(app_module, "MEMORY_AUDIT_PATH", audit_path)
+    monkeypatch.setenv("RIO_CONSOLE_IDENTITY_SECRET", secret)
+    monkeypatch.setattr(app_module, "require_console_admin", lambda actor_id: None)
+
+    response = client.get("/memory/1", headers={**HEADERS, "X-Rio-Actor-Id": "42", "X-Rio-Actor-Timestamp": timestamp, "X-Rio-Actor-Signature": signature})
+
+    assert response.status_code == 200
+    assert "content" not in response.text
+    assert json.loads(audit_path.read_text())["actor_id"] == "42"
