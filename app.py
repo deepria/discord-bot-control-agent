@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hmac
 import json
 import math
@@ -6,15 +7,15 @@ import os
 import sqlite3
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
 import psutil
 from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, Field, ValidationError
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
 
 app = FastAPI(title="Rio Agent")
 
@@ -39,6 +40,12 @@ DEPLOYMENT_STATUS_MAX_AGE_SECONDS = max(
 OPERATIONS_PATH = Path(
     os.getenv("RIO_OPERATIONS_PATH", "/opt/rio-agent/data/operations.jsonl")
 )
+MEMORY_AUDIT_PATH = Path(
+    os.getenv("RIO_MEMORY_AUDIT_PATH", "/opt/rio-agent/data/memory-access.jsonl")
+)
+TELEMETRY_MAX_AGE_SECONDS = max(60, int(os.getenv("RIO_TELEMETRY_MAX_AGE_SECONDS", "900")))
+JSONL_READ_MAX_BYTES = max(4096, int(os.getenv("RIO_JSONL_READ_MAX_BYTES", "1048576")))
+MAX_QUERY_WINDOW = timedelta(days=31)
 
 
 class DiscordIdentity(BaseModel):
@@ -177,14 +184,33 @@ def read_events(lines: int) -> list[dict]:
     return events
 
 
-def read_jsonl(path: Path, limit: int) -> tuple[list[dict], str]:
-    """Read a bounded JSONL tail; one corrupt row never fails the source."""
+def source_freshness(path: Path) -> dict:
+    """Return source state without treating old data as current data."""
     try:
-        rows = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        modified_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except FileNotFoundError:
+        return {"status": "UNAVAILABLE", "last_success_at": None, "error_code": "SOURCE_MISSING"}
+    except OSError:
+        return {"status": "UNAVAILABLE", "last_success_at": None, "error_code": "SOURCE_UNREADABLE"}
+    status = "HEALTHY" if datetime.now(timezone.utc) - modified_at <= timedelta(seconds=TELEMETRY_MAX_AGE_SECONDS) else "STALE"
+    return {"status": status, "last_success_at": modified_at.isoformat().replace("+00:00", "Z"), "error_code": None}
+
+
+def read_jsonl(path: Path, limit: int) -> tuple[list[dict], str]:
+    """Read a byte- and row-bounded JSONL tail; one corrupt row never fails the source."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - JSONL_READ_MAX_BYTES))
+            chunk = handle.read(JSONL_READ_MAX_BYTES)
     except FileNotFoundError:
         return [], "UNAVAILABLE"
     except OSError:
         return [], "UNAVAILABLE"
+    rows = chunk.decode("utf-8", errors="replace").splitlines()
+    if size > JSONL_READ_MAX_BYTES:
+        rows = rows[1:]
+    rows = rows[-limit:]
     values = []
     for row in rows:
         try:
@@ -193,7 +219,7 @@ def read_jsonl(path: Path, limit: int) -> tuple[list[dict], str]:
             continue
         if isinstance(value, dict):
             values.append(value)
-    return values, "HEALTHY"
+    return values, source_freshness(path)["status"]
 
 
 def safe_trace(row: dict) -> dict:
@@ -203,19 +229,64 @@ def safe_trace(row: dict) -> dict:
     return {key: json_safe(row[key]) for key in allowed if key in row}
 
 
-def traces(turn_id: str | None, limit: int) -> tuple[list[dict], str]:
-    rows, source = read_jsonl(EVENT_LOG_PATH, limit * 8)
+def parse_cursor(cursor: str | None) -> tuple[str, str, str] | None:
+    if not cursor:
+        return None
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(cursor + padding))
+        parsed = (value["at"], value["turn_id"], value["event"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="Invalid cursor") from None
+    if not all(isinstance(item, str) for item in parsed):
+        raise HTTPException(status_code=422, detail="Invalid cursor")
+    return parsed
+
+
+def encode_cursor(row: dict) -> str:
+    value = {key: str(row.get(key, "")) for key in ("at", "turn_id", "event")}
+    return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def validate_period(start: datetime | None, end: datetime | None) -> None:
+    if start and end and start > end:
+        raise HTTPException(status_code=422, detail="from must not be after to")
+    if start and end and end - start > MAX_QUERY_WINDOW:
+        raise HTTPException(status_code=422, detail="Requested period exceeds 31 days")
+
+
+def within_period(row: dict, start: datetime | None, end: datetime | None) -> bool:
+    at = row.get("at")
+    if not isinstance(at, str):
+        return start is None and end is None
+    try:
+        value = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (start is None or value >= start) and (end is None or value <= end)
+
+
+def traces(turn_id: str | None, limit: int, start: datetime | None = None,
+           end: datetime | None = None, cursor: str | None = None) -> tuple[list[dict], str, str | None]:
+    rows, source = read_jsonl(EVENT_LOG_PATH, limit * 16)
     result = [safe_trace(row) for row in rows if row.get("event", "").startswith("turn.")]
     if turn_id:
         result = [row for row in result if row.get("turn_id") == turn_id]
-    return result[-limit:], source
+    result = [row for row in result if within_period(row, start, end)]
+    result.sort(key=lambda row: (str(row.get("at", "")), str(row.get("turn_id", "")), str(row.get("event", ""))), reverse=True)
+    after = parse_cursor(cursor)
+    if after:
+        result = [row for row in result if (str(row.get("at", "")), str(row.get("turn_id", "")), str(row.get("event", ""))) < after]
+    page = result[:limit]
+    return page, source, encode_cursor(page[-1]) if len(result) > limit else None
 
 
-def usage_analytics(limit: int, group_by: Literal["provider", "model"]) -> tuple[list[dict], str]:
+def usage_analytics(limit: int, group_by: Literal["provider", "model"], start: datetime | None = None,
+                    end: datetime | None = None) -> tuple[list[dict], str]:
     rows, source = read_jsonl(USAGE_LOG_PATH, limit * 8)
     groups: dict[str, dict] = {}
     for row in rows:
-        if row.get("operation") != "answer":
+        if row.get("operation") != "answer" or not within_period(row, start, end):
             continue
         key = str(row.get(group_by) or "unknown")
         group = groups.setdefault(key, {group_by: key, "calls": 0, "errors": 0, "total_tokens": 0,
@@ -236,21 +307,83 @@ def usage_analytics(limit: int, group_by: Literal["provider", "model"]) -> tuple
     return result, source
 
 
-def read_memory_metadata(limit: int) -> tuple[list[dict], str]:
+def read_memory_metadata(limit: int, scope: Literal["channel", "owner_private"] | None = None,
+                         cursor: int | None = None) -> tuple[list[dict], str, int | None]:
     if not BOT_DB_PATH.exists():
-        return [], "UNAVAILABLE"
+        return [], "UNAVAILABLE", None
     try:
         connection = sqlite3.connect(f"file:{BOT_DB_PATH}?mode=ro", uri=True)
         connection.execute("PRAGMA query_only=ON")
+        predicates, values = [], []
+        if scope:
+            predicates.append("disclosure = ?")
+            values.append(scope)
+        if cursor is not None:
+            predicates.append("id < ?")
+            values.append(cursor)
+        where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
         rows = connection.execute(
             "SELECT id, owner_id, origin_realm, origin_channel_id, kind, disclosure, confidence, created_at "
-            "FROM structured_memory_items ORDER BY id DESC LIMIT ?", (limit,)
+            f"FROM structured_memory_items{where} ORDER BY id DESC LIMIT ?", (*values, limit + 1)
         ).fetchall()
         connection.close()
     except sqlite3.Error:
-        return [], "UNAVAILABLE"
-    return [dict(zip(("id", "owner_id", "origin_realm", "origin_channel_id", "kind", "disclosure",
-                           "confidence", "created_at"), row)) for row in rows], "HEALTHY"
+        return [], "UNAVAILABLE", None
+    result = [dict(zip(("id", "owner_id", "origin_realm", "origin_channel_id", "kind", "disclosure",
+                         "confidence", "created_at"), row)) for row in rows[:limit]]
+    next_cursor = result[-1]["id"] if len(rows) > limit and result else None
+    return result, source_freshness(BOT_DB_PATH)["status"], next_cursor
+
+
+def read_memory_item_metadata(item_id: int) -> tuple[dict | None, str]:
+    """Read only display-safe metadata. Memory content never leaves the Bot DB here."""
+    try:
+        connection = sqlite3.connect(f"file:{BOT_DB_PATH}?mode=ro", uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        row = connection.execute(
+            "SELECT id, owner_id, origin_realm, origin_channel_id, kind, disclosure, confidence, created_at "
+            "FROM structured_memory_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        connection.close()
+    except sqlite3.Error:
+        return None, "UNAVAILABLE"
+    if row is None:
+        return None, source_freshness(BOT_DB_PATH)["status"]
+    return dict(zip(("id", "owner_id", "origin_realm", "origin_channel_id", "kind", "disclosure",
+                     "confidence", "created_at"), row)), source_freshness(BOT_DB_PATH)["status"]
+
+
+def require_signed_console_admin(
+    actor_id: str | None, actor_timestamp: str | None, actor_signature: str | None
+) -> str:
+    """Verify Console's short-lived, HMAC-bound OAuth identity before sensitive reads."""
+    secret = os.getenv("RIO_CONSOLE_IDENTITY_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Memory detail authorization is unavailable")
+    if not actor_id or not actor_timestamp or not actor_signature:
+        raise HTTPException(status_code=401, detail="Signed Console identity is required")
+    try:
+        timestamp = datetime.fromisoformat(actor_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Console identity") from None
+    if timestamp.tzinfo is None or abs((datetime.now(timezone.utc) - timestamp).total_seconds()) > 300:
+        raise HTTPException(status_code=401, detail="Expired Console identity")
+    expected = hmac.new(secret.encode(), f"{actor_id}.{actor_timestamp}".encode(), "sha256").hexdigest()
+    if not hmac.compare_digest(actor_signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid Console identity")
+    require_console_admin(actor_id)
+    return actor_id
+
+
+def append_memory_audit(record: dict) -> None:
+    try:
+        MEMORY_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MEMORY_AUDIT_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Memory access audit is unavailable") from exc
 
 
 def unknown_deployment_status(component: Literal["bot", "agent"], detail: str) -> dict:
@@ -706,44 +839,78 @@ def events(
 
 @app.get("/traces")
 def trace_list(
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None),
     authorization: str | None = Header(default=None),
 ):
     verify_token(authorization)
-    rows, source = traces(None, limit)
-    return {"source_status": source, "traces": rows}
+    validate_period(from_, to)
+    rows, source, next_cursor = traces(None, limit, from_, to, cursor)
+    return {"source": source_freshness(EVENT_LOG_PATH), "source_status": source,
+            "traces": rows, "next_cursor": next_cursor}
 
 
 @app.get("/traces/{turn_id}")
 def trace_detail(turn_id: UUID, authorization: str | None = Header(default=None)):
     verify_token(authorization)
-    rows, source = traces(str(turn_id), 100)
+    rows, source, _ = traces(str(turn_id), 100)
     if not rows and source == "UNAVAILABLE":
         raise HTTPException(status_code=503, detail="Trace source is unavailable")
     if not rows:
         raise HTTPException(status_code=404, detail="Trace not found")
-    return {"source_status": source, "trace": rows}
+    return {"source": source_freshness(EVENT_LOG_PATH), "source_status": source, "trace": rows}
 
 
 @app.get("/analytics/usage")
 def analytics_usage(
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     group_by: Literal["provider", "model"] = "provider",
     authorization: str | None = Header(default=None),
 ):
     verify_token(authorization)
-    rows, source = usage_analytics(limit, group_by)
-    return {"source_status": source, "group_by": group_by, "groups": rows}
+    validate_period(from_, to)
+    rows, source = usage_analytics(limit, group_by, from_, to)
+    return {"source": source_freshness(USAGE_LOG_PATH), "source_status": source,
+            "group_by": group_by, "groups": rows}
 
 
 @app.get("/memory")
 def memory_list(
     limit: int = Query(default=50, ge=1, le=100),
+    scope: Literal["channel", "owner_private"] | None = None,
+    cursor: int | None = Query(default=None, ge=1),
     authorization: str | None = Header(default=None),
 ):
     verify_token(authorization)
-    rows, source = read_memory_metadata(limit)
-    return {"source_status": source, "memory": rows}
+    rows, source, next_cursor = read_memory_metadata(limit, scope, cursor)
+    return {"source": source_freshness(BOT_DB_PATH), "source_status": source,
+            "memory": rows, "next_cursor": next_cursor}
+
+
+@app.get("/memory/{item_id}")
+def memory_detail(
+    item_id: int,
+    actor_id: str | None = Header(default=None, alias="X-Rio-Actor-Id"),
+    actor_timestamp: str | None = Header(default=None, alias="X-Rio-Actor-Timestamp"),
+    actor_signature: str | None = Header(default=None, alias="X-Rio-Actor-Signature"),
+    authorization: str | None = Header(default=None),
+):
+    verify_token(authorization)
+    verified_actor = require_signed_console_admin(actor_id, actor_timestamp, actor_signature)
+    item, source = read_memory_item_metadata(item_id)
+    if source == "UNAVAILABLE":
+        raise HTTPException(status_code=503, detail="Memory source is unavailable")
+    if item is None:
+        raise HTTPException(status_code=404, detail="Memory item not found")
+    append_memory_audit({
+        "at": utc_now(), "kind": "memory.metadata.read", "actor_kind": "console",
+        "actor_id": verified_actor, "item_id": item_id, "outcome": "success",
+    })
+    return {"source": source_freshness(BOT_DB_PATH), "source_status": source, "memory": item}
 
 
 @app.get("/data-sources")
@@ -751,8 +918,11 @@ def data_sources(authorization: str | None = Header(default=None)):
     verify_token(authorization)
     _, events_status = read_jsonl(EVENT_LOG_PATH, 1)
     _, usage_status = read_jsonl(USAGE_LOG_PATH, 1)
-    _, memory_status = read_memory_metadata(1)
-    return {"sources": {"events": events_status, "usage": usage_status, "memory": memory_status}}
+    _, memory_status, _ = read_memory_metadata(1)
+    return {"sources": {
+        "events": source_freshness(EVENT_LOG_PATH), "usage": source_freshness(USAGE_LOG_PATH),
+        "memory": source_freshness(BOT_DB_PATH),
+    }, "source_status": {"events": events_status, "usage": usage_status, "memory": memory_status}}
 
 
 @app.get("/deployments")
