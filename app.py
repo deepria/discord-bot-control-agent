@@ -7,11 +7,12 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 import psutil
 from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Rio Agent")
@@ -23,6 +24,15 @@ STATUS_PATH = Path(os.getenv("RIO_STATUS_PATH", "/opt/rio-discord-bot/data/logs/
 BOT_REPO = Path(os.getenv("RIO_BOT_REPO", "/opt/rio-discord-bot"))
 AGENT_REPO = Path(os.getenv("RIO_AGENT_REPO", "/opt/rio-agent"))
 BOT_PYTHON = os.getenv("RIO_BOT_PYTHON", str(BOT_REPO / ".venv" / "bin" / "python"))
+BOT_DEPLOY_STATUS_PATH = Path(
+    os.getenv("RIO_BOT_DEPLOY_STATUS_PATH", "/run/rio-agent/deployments/bot.json")
+)
+AGENT_DEPLOY_STATUS_PATH = Path(
+    os.getenv("RIO_AGENT_DEPLOY_STATUS_PATH", "/run/rio-agent/deployments/agent.json")
+)
+DEPLOYMENT_STATUS_MAX_AGE_SECONDS = max(
+    60, int(os.getenv("RIO_DEPLOYMENT_STATUS_MAX_AGE_SECONDS", "900"))
+)
 
 
 class DiscordIdentity(BaseModel):
@@ -44,6 +54,30 @@ class PolicyWrite(BaseModel):
     value: str
     request_id: UUID
     actor_id: str
+
+
+class DeploymentCheck(BaseModel):
+    name: str
+    status: Literal["passed", "failed", "skipped", "unknown"]
+    at: datetime
+    detail: str | None = None
+
+
+class DeploymentStatusRecord(BaseModel):
+    schema_version: Literal[1]
+    deployment_id: str
+    component: Literal["bot", "agent"]
+    target_revision: str | None = None
+    running_revision: str | None = None
+    status: Literal["queued", "running", "succeeded", "failed", "stale", "unknown"]
+    phase: str
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    verified_at: datetime | None = None
+    checks: list[DeploymentCheck] = Field(default_factory=list)
+    previous_revision: str | None = None
+    log_ref: str | None = None
+    error: str | None = None
 
 
 def run(cmd: list[str]):
@@ -98,44 +132,60 @@ def read_events(lines: int) -> list[dict]:
     return events
 
 
-def command_value(cmd: list[str]) -> str:
-    result = run(cmd)
-    return result.stdout.strip() if result.returncode == 0 else ""
+def unknown_deployment_status(component: Literal["bot", "agent"], detail: str) -> dict:
+    return DeploymentStatusRecord(
+        schema_version=1,
+        deployment_id=f"{component}-observation-unconfigured",
+        component=component,
+        status="unknown",
+        phase="observation",
+        error=detail,
+    ).model_dump(mode="json")
 
 
-def systemd_properties(unit: str, properties: list[str]) -> dict[str, str]:
-    result = run(["systemctl", "show", unit, *[f"--property={name}" for name in properties]])
-    values = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key] = value
-    return values
+def deployment_status(
+    component: Literal["bot", "agent"], status_path: Path
+) -> dict:
+    """Return deploy-produced evidence, never infer success from service state."""
+    try:
+        value = json.loads(status_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return unknown_deployment_status(
+            component, "Deployment status has not been configured yet."
+        )
+    except (OSError, json.JSONDecodeError):
+        return unknown_deployment_status(component, "Deployment status file is unreadable.")
+    try:
+        record = DeploymentStatusRecord.model_validate(value)
+    except ValidationError:
+        return unknown_deployment_status(component, "Invalid deployment status data.")
 
-
-def deployment_status(name: str, repo: Path, service: str, timer: str) -> dict:
-    revision = command_value(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"])
-    remote_revision = command_value(
-        ["git", "-C", str(repo), "rev-parse", "--short", "origin/main"]
-    )
-    dirty = bool(command_value(["git", "-C", str(repo), "status", "--porcelain"]))
-    service_state = systemd_properties(
-        service,
-        ["ActiveState", "SubState", "Result", "ExecMainStatus", "ExecMainExitTimestamp"],
-    )
-    timer_state = systemd_properties(
-        timer,
-        ["ActiveState", "NextElapseUSecRealtime", "LastTriggerUSec"],
-    )
-    return {
-        "component": name,
-        "revision": revision or None,
-        "remote_revision": remote_revision or None,
-        "update_available": bool(revision and remote_revision and revision != remote_revision),
-        "working_tree_dirty": dirty,
-        "service": service_state,
-        "timer": timer_state,
-    }
+    if record.component != component:
+        return unknown_deployment_status(
+            component, "Deployment status component does not match its endpoint."
+        )
+    if record.status == "succeeded":
+        if not record.target_revision or not record.running_revision:
+            return unknown_deployment_status(
+                component, "A successful deployment is missing revision attestation."
+            )
+        if record.target_revision != record.running_revision:
+            return unknown_deployment_status(
+                component, "Deployment target and running revisions do not match."
+            )
+        if record.verified_at is None:
+            return unknown_deployment_status(
+                component, "A successful deployment is missing its verification time."
+            )
+        if not record.checks or any(check.status != "passed" for check in record.checks):
+            return unknown_deployment_status(
+                component, "A successful deployment is missing passing readiness checks."
+            )
+        age_seconds = (datetime.now(timezone.utc) - record.verified_at).total_seconds()
+        if age_seconds > DEPLOYMENT_STATUS_MAX_AGE_SECONDS:
+            record.status = "stale"
+            record.error = "Deployment verification is older than the freshness window."
+    return record.model_dump(mode="json")
 
 
 def read_runtime_settings() -> dict:
@@ -539,10 +589,8 @@ def deployments(authorization: str | None = Header(default=None)):
     return {
         "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "deployments": [
-            deployment_status("bot", BOT_REPO, "rio-bot-deploy.service", "rio-bot-deploy.timer"),
-            deployment_status(
-                "agent", AGENT_REPO, "rio-agent-deploy.service", "rio-agent-deploy.timer"
-            ),
+            deployment_status("bot", BOT_DEPLOY_STATUS_PATH),
+            deployment_status("agent", AGENT_DEPLOY_STATUS_PATH),
         ],
     }
 
