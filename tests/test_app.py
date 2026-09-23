@@ -85,3 +85,54 @@ def test_deployment_status_rejects_revision_mismatch(tmp_path):
 
     assert result["status"] == "unknown"
     assert "do not match" in result["error"]
+
+
+def test_bot_control_writes_content_free_persistent_operation(monkeypatch, tmp_path):
+    operations_path = tmp_path / "operations.jsonl"
+    monkeypatch.setattr(app_module, "OPERATIONS_PATH", operations_path)
+    monkeypatch.setattr(app_module, "require_console_admin", lambda actor_id: None)
+
+    class Completed:
+        returncode = 0
+        stdout = "active\n"
+
+    monkeypatch.setattr(app_module, "run", lambda command: Completed())
+    response = client.post(
+        "/bot/restart",
+        headers=HEADERS,
+        json={
+            "actor_id": "123456789012345678",
+            "request_id": "8c2e2390-fbf1-445c-8f97-d680903aac47",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "success"
+    assert response.json()["post_check"] == "healthy"
+    stored = json.loads(operations_path.read_text(encoding="utf-8"))
+    assert stored["kind"] == "bot.restart"
+    assert stored["actor_id"] == "123456789012345678"
+    assert "stderr" not in stored
+
+
+def test_operations_returns_newest_first(monkeypatch, tmp_path):
+    operations_path = tmp_path / "operations.jsonl"
+    operations_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"operation_id": "older", "result": "success"}),
+                json.dumps({"operation_id": "newer", "result": "failure"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "OPERATIONS_PATH", operations_path)
+
+    response = client.get("/operations", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert [item["operation_id"] for item in response.json()["operations"]] == [
+        "newer",
+        "older",
+    ]

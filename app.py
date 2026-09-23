@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psutil
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -33,6 +33,9 @@ AGENT_DEPLOY_STATUS_PATH = Path(
 DEPLOYMENT_STATUS_MAX_AGE_SECONDS = max(
     60, int(os.getenv("RIO_DEPLOYMENT_STATUS_MAX_AGE_SECONDS", "900"))
 )
+OPERATIONS_PATH = Path(
+    os.getenv("RIO_OPERATIONS_PATH", "/opt/rio-agent/data/operations.jsonl")
+)
 
 
 class DiscordIdentity(BaseModel):
@@ -54,6 +57,11 @@ class PolicyWrite(BaseModel):
     value: str
     request_id: UUID
     actor_id: str
+
+
+class BotControlRequest(BaseModel):
+    actor_id: str
+    request_id: UUID
 
 
 class DeploymentCheck(BaseModel):
@@ -106,6 +114,40 @@ def json_safe(value):
     if isinstance(value, (list, tuple)):
         return [json_safe(item) for item in value]
     return value
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def append_operation(record: dict) -> None:
+    """Persist minimal, content-free control evidence outside Bot data."""
+    try:
+        OPERATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with OPERATIONS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Operation audit is unavailable") from exc
+
+
+def read_operations(limit: int) -> list[dict]:
+    try:
+        rows = OPERATIONS_PATH.read_text(encoding="utf-8").splitlines()[-limit:]
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Operation audit is unavailable") from exc
+    records = []
+    for row in reversed(rows):
+        try:
+            value = json.loads(row)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(json_safe(value))
+    return records
 
 
 def read_status() -> dict | None:
@@ -595,58 +637,67 @@ def deployments(authorization: str | None = Header(default=None)):
     }
 
 
-@app.post("/bot/start")
-def bot_start(authorization: str | None = Header(default=None)):
+@app.get("/operations")
+def operations(
+    limit: int = Query(default=50, ge=1, le=100),
+    authorization: str | None = Header(default=None),
+):
     verify_token(authorization)
+    return {"operations": read_operations(limit)}
 
-    result = run(["systemctl", "start", SERVICE])
 
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=result.stderr.strip()
-        )
-
-    return {
-        "ok": True,
-        "action": "start"
+def bot_control(
+    action: Literal["start", "stop", "restart"], request: BotControlRequest
+) -> dict:
+    require_console_admin(request.actor_id)
+    requested_at = utc_now()
+    result = run(["systemctl", action, SERVICE])
+    post_check = run(["systemctl", "is-active", SERVICE]).stdout.strip()
+    expected_state = "inactive" if action == "stop" else "active"
+    succeeded = result.returncode == 0 and post_check == expected_state
+    completed_at = utc_now()
+    operation = {
+        "operation_id": str(uuid4()),
+        "kind": f"bot.{action}",
+        "actor_kind": "console",
+        "actor_id": request.actor_id,
+        "request_id": str(request.request_id),
+        "requested_at": requested_at,
+        "completed_at": completed_at,
+        "result": "success" if succeeded else "failure",
+        "post_check": "healthy" if succeeded else "failed",
+        "service_state": post_check or "unknown",
+        "error": None if succeeded else "Bot control command or post-check failed.",
     }
+    append_operation(operation)
+    if not succeeded:
+        raise HTTPException(status_code=502, detail="Bot control command or post-check failed")
+    return operation
+
+
+@app.post("/bot/start")
+def bot_start(
+    request: BotControlRequest, authorization: str | None = Header(default=None)
+):
+    verify_token(authorization)
+    return bot_control("start", request)
 
 
 @app.post("/bot/stop")
-def bot_stop(authorization: str | None = Header(default=None)):
+def bot_stop(
+    request: BotControlRequest, authorization: str | None = Header(default=None)
+):
     verify_token(authorization)
+    return bot_control("stop", request)
 
-    result = run(["systemctl", "stop", SERVICE])
-
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=result.stderr.strip()
-        )
-
-    return {
-        "ok": True,
-        "action": "stop"
-    }
 
 
 @app.post("/bot/restart")
-def bot_restart(authorization: str | None = Header(default=None)):
+def bot_restart(
+    request: BotControlRequest, authorization: str | None = Header(default=None)
+):
     verify_token(authorization)
-
-    result = run(["systemctl", "restart", SERVICE])
-
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=result.stderr.strip()
-        )
-
-    return {
-        "ok": True,
-        "action": "restart"
-    }
+    return bot_control("restart", request)
 
 @app.get("/logs/stream")
 async def logs_stream(authorization: str | None = Header(default=None)):
