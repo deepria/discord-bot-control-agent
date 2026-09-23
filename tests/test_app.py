@@ -136,3 +136,38 @@ def test_operations_returns_newest_first(monkeypatch, tmp_path):
         "newer",
         "older",
     ]
+
+
+def test_trace_endpoint_filters_content_and_tolerates_corrupt_jsonl(monkeypatch, tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        "not-json\n" + json.dumps({
+            "event": "turn.completed", "turn_id": "9f5f7fad-70d1-4e69-8b2b-5d7b5ebf6978",
+            "provider": "gemini", "content": "must-not-leak",
+        }) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(app_module, "EVENT_LOG_PATH", path)
+
+    response = client.get("/traces", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["traces"] == [{
+        "event": "turn.completed", "turn_id": "9f5f7fad-70d1-4e69-8b2b-5d7b5ebf6978",
+        "provider": "gemini",
+    }]
+
+
+def test_memory_reader_uses_read_only_sqlite_metadata(monkeypatch, tmp_path):
+    database = tmp_path / "rio.sqlite3"
+    connection = __import__("sqlite3").connect(database)
+    connection.execute("CREATE TABLE structured_memory_items (id INTEGER, owner_id TEXT, origin_realm TEXT, origin_channel_id TEXT, kind TEXT, disclosure TEXT, confidence REAL, created_at TEXT, content TEXT)")
+    connection.execute("INSERT INTO structured_memory_items VALUES (1, 'u', 'r', 'c', 'fact', 'owner_private', .8, '2026-09-23', 'secret')")
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(app_module, "BOT_DB_PATH", database)
+
+    response = client.get("/memory", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["memory"][0]["kind"] == "fact"
+    assert "content" not in response.text
