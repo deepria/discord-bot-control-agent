@@ -3,6 +3,7 @@ import hmac
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -20,6 +21,8 @@ app = FastAPI(title="Rio Agent")
 SERVICE = "rio-bot.service"
 TOKEN = os.environ["RIO_AGENT_TOKEN"]
 EVENT_LOG_PATH = Path(os.getenv("RIO_EVENT_LOG_PATH", "/opt/rio-discord-bot/data/logs/events.jsonl"))
+USAGE_LOG_PATH = Path(os.getenv("RIO_USAGE_LOG_PATH", "/opt/rio-discord-bot/data/logs/usage.jsonl"))
+BOT_DB_PATH = Path(os.getenv("RIO_BOT_DB_PATH", "/opt/rio-discord-bot/data/rio.sqlite3"))
 STATUS_PATH = Path(os.getenv("RIO_STATUS_PATH", "/opt/rio-discord-bot/data/logs/status.json"))
 BOT_REPO = Path(os.getenv("RIO_BOT_REPO", "/opt/rio-discord-bot"))
 AGENT_REPO = Path(os.getenv("RIO_AGENT_REPO", "/opt/rio-agent"))
@@ -172,6 +175,82 @@ def read_events(lines: int) -> list[dict]:
         if isinstance(value, dict):
             events.append(json_safe(value))
     return events
+
+
+def read_jsonl(path: Path, limit: int) -> tuple[list[dict], str]:
+    """Read a bounded JSONL tail; one corrupt row never fails the source."""
+    try:
+        rows = path.read_text(encoding="utf-8").splitlines()[-limit:]
+    except FileNotFoundError:
+        return [], "UNAVAILABLE"
+    except OSError:
+        return [], "UNAVAILABLE"
+    values = []
+    for row in rows:
+        try:
+            value = json.loads(row)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            values.append(value)
+    return values, "HEALTHY"
+
+
+def safe_trace(row: dict) -> dict:
+    allowed = {"at", "schema_version", "event", "turn_id", "operation", "status", "provider",
+               "model", "routing", "latency_ms", "tokens", "web_search_calls", "memory_lifecycle",
+               "error_type"}
+    return {key: json_safe(row[key]) for key in allowed if key in row}
+
+
+def traces(turn_id: str | None, limit: int) -> tuple[list[dict], str]:
+    rows, source = read_jsonl(EVENT_LOG_PATH, limit * 8)
+    result = [safe_trace(row) for row in rows if row.get("event", "").startswith("turn.")]
+    if turn_id:
+        result = [row for row in result if row.get("turn_id") == turn_id]
+    return result[-limit:], source
+
+
+def usage_analytics(limit: int, group_by: Literal["provider", "model"]) -> tuple[list[dict], str]:
+    rows, source = read_jsonl(USAGE_LOG_PATH, limit * 8)
+    groups: dict[str, dict] = {}
+    for row in rows:
+        if row.get("operation") != "answer":
+            continue
+        key = str(row.get(group_by) or "unknown")
+        group = groups.setdefault(key, {group_by: key, "calls": 0, "errors": 0, "total_tokens": 0,
+                                        "latency_ms": []})
+        group["calls"] += 1
+        group["errors"] += int(row.get("status") == "error")
+        if isinstance(row.get("total_tokens"), int):
+            group["total_tokens"] += row["total_tokens"]
+        if isinstance(row.get("elapsed_ms"), int):
+            group["latency_ms"].append(row["elapsed_ms"])
+    result = []
+    for group in groups.values():
+        latency = sorted(group.pop("latency_ms"))
+        group["success_rate"] = (group["calls"] - group["errors"]) / group["calls"]
+        group["p50_latency_ms"] = latency[len(latency) // 2] if latency else None
+        group["p95_latency_ms"] = latency[min(len(latency) - 1, int(len(latency) * .95))] if latency else None
+        result.append(group)
+    return result, source
+
+
+def read_memory_metadata(limit: int) -> tuple[list[dict], str]:
+    if not BOT_DB_PATH.exists():
+        return [], "UNAVAILABLE"
+    try:
+        connection = sqlite3.connect(f"file:{BOT_DB_PATH}?mode=ro", uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        rows = connection.execute(
+            "SELECT id, owner_id, origin_realm, origin_channel_id, kind, disclosure, confidence, created_at "
+            "FROM structured_memory_items ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        connection.close()
+    except sqlite3.Error:
+        return [], "UNAVAILABLE"
+    return [dict(zip(("id", "owner_id", "origin_realm", "origin_channel_id", "kind", "disclosure",
+                           "confidence", "created_at"), row)) for row in rows], "HEALTHY"
 
 
 def unknown_deployment_status(component: Literal["bot", "agent"], detail: str) -> dict:
@@ -623,6 +702,57 @@ def events(
 ):
     verify_token(authorization)
     return {"events": read_events(max(1, min(lines, 500)))}
+
+
+@app.get("/traces")
+def trace_list(
+    limit: int = Query(default=50, ge=1, le=100),
+    authorization: str | None = Header(default=None),
+):
+    verify_token(authorization)
+    rows, source = traces(None, limit)
+    return {"source_status": source, "traces": rows}
+
+
+@app.get("/traces/{turn_id}")
+def trace_detail(turn_id: UUID, authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    rows, source = traces(str(turn_id), 100)
+    if not rows and source == "UNAVAILABLE":
+        raise HTTPException(status_code=503, detail="Trace source is unavailable")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return {"source_status": source, "trace": rows}
+
+
+@app.get("/analytics/usage")
+def analytics_usage(
+    limit: int = Query(default=100, ge=1, le=500),
+    group_by: Literal["provider", "model"] = "provider",
+    authorization: str | None = Header(default=None),
+):
+    verify_token(authorization)
+    rows, source = usage_analytics(limit, group_by)
+    return {"source_status": source, "group_by": group_by, "groups": rows}
+
+
+@app.get("/memory")
+def memory_list(
+    limit: int = Query(default=50, ge=1, le=100),
+    authorization: str | None = Header(default=None),
+):
+    verify_token(authorization)
+    rows, source = read_memory_metadata(limit)
+    return {"source_status": source, "memory": rows}
+
+
+@app.get("/data-sources")
+def data_sources(authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    _, events_status = read_jsonl(EVENT_LOG_PATH, 1)
+    _, usage_status = read_jsonl(USAGE_LOG_PATH, 1)
+    _, memory_status = read_memory_metadata(1)
+    return {"sources": {"events": events_status, "usage": usage_status, "memory": memory_status}}
 
 
 @app.get("/deployments")
