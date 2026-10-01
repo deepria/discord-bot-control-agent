@@ -14,8 +14,8 @@ from uuid import UUID, uuid4
 
 import psutil
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 app = FastAPI(title="Rio Agent")
 
@@ -72,6 +72,16 @@ class PolicyWrite(BaseModel):
 class BotControlRequest(BaseModel):
     actor_id: str
     request_id: UUID
+
+
+class PresenceWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["auto", "manual"]
+    status: Literal["online", "idle", "dnd", "invisible"]
+    activity_type: Literal["playing", "watching", "listening"]
+    activity_text: str = Field(min_length=1, max_length=128)
+    request_id: UUID
+    actor_id: str
 
 
 class DeploymentCheck(BaseModel):
@@ -440,6 +450,54 @@ def deployment_status(
             record.status = "stale"
             record.error = "Deployment verification is older than the freshness window."
     return record.model_dump(mode="json")
+
+
+def presence_call(action: str, *, request_id: str | None = None,
+                  payload: dict | None = None, actor_id: str | None = None) -> dict:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, (
+        str(BOT_REPO / "src"), environment.get("PYTHONPATH"),
+    )))
+    try:
+        result = subprocess.run(
+            [BOT_PYTHON, "-c", "from rio_bot.core.presence import control_main; control_main()"],
+            input=json.dumps({"action": action, "request_id": request_id,
+                              "payload": payload, "actor_id": actor_id}),
+            capture_output=True, cwd=BOT_REPO, env=environment, text=True, timeout=5,
+        )
+        response = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Bot Presence 서비스에 연결할 수 없습니다.") from exc
+    if result.returncode != 0 or not isinstance(response, dict):
+        raise HTTPException(status_code=503, detail="Bot Presence 응답이 올바르지 않습니다.")
+    if response.get("ok") is not True:
+        code = response.get("status_code")
+        detail = response.get("detail")
+        raise HTTPException(
+            status_code=code if code in {404, 409, 422, 503} else 503,
+            detail=detail if isinstance(detail, str) and len(detail) <= 300 else "Presence 요청이 실패했습니다.",
+        )
+    if not isinstance(response.get("presence"), dict):
+        raise HTTPException(status_code=503, detail="Bot Presence 응답이 올바르지 않습니다.")
+    return response["presence"]
+
+
+@app.get("/bot/presence")
+def bot_presence(request_id: UUID | None = None, authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    return presence_call("get", request_id=str(request_id) if request_id else None)
+
+
+@app.put("/bot/presence")
+def set_bot_presence(write: PresenceWrite, authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    require_console_admin(write.actor_id)
+    result = presence_call(
+        "put", request_id=str(write.request_id), actor_id=write.actor_id,
+        payload=write.model_dump(exclude={"request_id", "actor_id"}),
+    )
+    pending = result.get("operation", {}).get("state") in {"queued", "applying"}
+    return JSONResponse(result, status_code=202 if pending else 200)
 
 
 def read_runtime_settings() -> dict:
