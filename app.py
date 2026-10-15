@@ -401,6 +401,57 @@ def read_memory_item_metadata(item_id: int) -> tuple[dict | None, str]:
                      "confidence", "created_at"), row)), source_freshness(BOT_DB_PATH)["status"]
 
 
+def read_memory_item_content(item_id: int) -> tuple[dict | None, str]:
+    """Explicit administrator read; never load conversations or instantiate Bot Store."""
+    try:
+        connection = sqlite3.connect(BOT_DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT id, owner_id, owner_type, origin_realm, origin_channel_id, "
+                "origin_public_at_capture, kind, content, disclosure, confidence, status, "
+                "superseded_by, created_at, updated_at, source_message_ids, source_turn_ids "
+                "FROM structured_memory_items WHERE id = ?", (item_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None, "UNAVAILABLE"
+    if row is None:
+        return None, source_freshness(BOT_DB_PATH)["status"]
+    item = dict(row)
+    item["origin_public_at_capture"] = bool(item["origin_public_at_capture"])
+    for field in ("created_at", "updated_at"):
+        try:
+            timestamp = datetime.fromisoformat(item[field].replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            item[field] = timestamp.astimezone(timezone.utc).isoformat()
+        except (AttributeError, TypeError, ValueError):
+            item[field] = None
+    messages = str(item.pop("source_message_ids") or "").split(",")
+    turns = str(item.pop("source_turn_ids") or "").split(",")
+    guild_id = item["origin_realm"].removeprefix("guild:")
+    guild_source = item["origin_realm"].startswith("guild:") and guild_id.isascii() and guild_id.isdecimal()
+    channel_id = str(item["origin_channel_id"])
+    item["sources"] = []
+    for index, message_id in enumerate(messages[:8]):
+        if not message_id.strip():
+            continue
+        turn_id = turns[index].strip() if index < len(turns) else ""
+        linkable = guild_source and all(value.isascii() and value.isdecimal()
+                                       for value in (channel_id, message_id))
+        item["sources"].append({
+            "message_id": message_id, "turn_id": turn_id or None,
+            "message_url": f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+            if linkable else None,
+        })
+    # This release's structured writer remains shadow-only; the answer path does not use it.
+    item["usage_state"] = "shadow_only"
+    return item, source_freshness(BOT_DB_PATH)["status"]
+
+
 def require_signed_console_admin(
     actor_id: str | None, actor_timestamp: str | None, actor_signature: str | None
 ) -> str:
@@ -1011,6 +1062,7 @@ def memory_evaluation(authorization: str | None = Header(default=None)):
 @app.get("/memory/{item_id}")
 def memory_detail(
     item_id: int,
+    include_content: bool = False,
     actor_id: str | None = Header(default=None, alias="X-Rio-Actor-Id"),
     actor_timestamp: str | None = Header(default=None, alias="X-Rio-Actor-Timestamp"),
     actor_signature: str | None = Header(default=None, alias="X-Rio-Actor-Signature"),
@@ -1018,16 +1070,20 @@ def memory_detail(
 ):
     verify_token(authorization)
     verified_actor = require_signed_console_admin(actor_id, actor_timestamp, actor_signature)
-    item, source = read_memory_item_metadata(item_id)
+    reader = read_memory_item_content if include_content else read_memory_item_metadata
+    item, source = reader(item_id)
     if source == "UNAVAILABLE":
         raise HTTPException(status_code=503, detail="Memory source is unavailable")
     if item is None:
         raise HTTPException(status_code=404, detail="Memory item not found")
     append_memory_audit({
-        "at": utc_now(), "kind": "memory.metadata.read", "actor_kind": "console",
+        "at": utc_now(), "kind": "memory.content.read" if include_content else "memory.metadata.read", "actor_kind": "console",
         "actor_id": verified_actor, "item_id": item_id, "outcome": "success",
     })
-    return {"source": source_freshness(BOT_DB_PATH), "source_status": source, "memory": item}
+    return JSONResponse(
+        {"source": source_freshness(BOT_DB_PATH), "source_status": source, "memory": item},
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/data-sources")
