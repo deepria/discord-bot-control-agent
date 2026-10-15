@@ -25,6 +25,14 @@ with bounded reads and never write to the Bot database.
   of `<actor_id>.<timestamp>`, signed with `RIO_CONSOLE_IDENTITY_SECRET`; the
   timestamp is valid for five minutes. Every successful read is recorded in
   `RIO_MEMORY_AUDIT_PATH` without memory content.
+- `GET /memory/{item_id}?include_content=true` explicitly includes the stored
+  memory candidate text, lifecycle, owner/scope, source message/turn IDs, and
+  guild-message links under the same signed administrator authorization. It reads
+  only the selected item; it never loads original conversations or calls Discord.
+  A missing turn ID is returned as null, not guessed. `usage_state=shadow_only`
+  describes the current writer's exclusion from the answer path. Content reads
+  require a successful `memory.content.read` audit before returning, and use
+  `Cache-Control: no-store`. Public lists and aggregate reports never include text.
 - `GET /data-sources` reports each source as `HEALTHY`, `STALE`, or
   `UNAVAILABLE`, including the source modification time and safe error code.
 
