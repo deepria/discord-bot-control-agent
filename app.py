@@ -84,6 +84,44 @@ class PresenceWrite(BaseModel):
     actor_id: str
 
 
+class MemoryEvaluationItems(BaseModel):
+    total: int = Field(ge=0, strict=True)
+    active: int = Field(ge=0, strict=True)
+    superseded: int = Field(ge=0, strict=True)
+    deleted: int = Field(ge=0, strict=True)
+    other_status: int = Field(ge=0, strict=True)
+
+
+class MemoryEvaluationProvenance(BaseModel):
+    active_message_linked: int = Field(ge=0, strict=True)
+    active_turn_linked: int = Field(ge=0, strict=True)
+
+
+class MemoryEvaluationObservation(BaseModel):
+    first_item_at: datetime | None
+    last_item_at: datetime | None
+    elapsed_days: int = Field(ge=0, strict=True)
+
+
+class MemoryEvaluationReadiness(BaseModel):
+    minimum_active_items: int = Field(ge=1, strict=True)
+    minimum_days: int = Field(ge=1, strict=True)
+    ready_for_metadata_review: bool = Field(strict=True)
+    reasons: list[Literal[
+        "database_unavailable", "shadow_schema_unavailable", "database_read_failed",
+        "insufficient_active_items", "insufficient_observation_days", "invalid_item_timestamp",
+        "missing_message_provenance", "missing_turn_provenance", "unknown_lifecycle_status",
+    ]]
+
+
+class MemoryEvaluationReport(BaseModel):
+    source_status: Literal["HEALTHY", "UNAVAILABLE"]
+    items: MemoryEvaluationItems
+    provenance: MemoryEvaluationProvenance
+    observation: MemoryEvaluationObservation
+    readiness: MemoryEvaluationReadiness
+
+
 class DeploymentCheck(BaseModel):
     name: str
     status: Literal["passed", "failed", "skipped", "unknown"]
@@ -947,6 +985,27 @@ def memory_list(
     rows, source, next_cursor = read_memory_metadata(limit, scope, cursor)
     return {"source": source_freshness(BOT_DB_PATH), "source_status": source,
             "memory": rows, "next_cursor": next_cursor}
+
+
+@app.get("/memory/evaluation")
+def memory_evaluation(authorization: str | None = Header(default=None)):
+    verify_token(authorization)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, (
+        str(BOT_REPO / "src"), environment.get("PYTHONPATH"),
+    )))
+    try:
+        result = subprocess.run(
+            [BOT_PYTHON, "-m", "rio_bot.tooling.memory_evaluation", "--db", str(BOT_DB_PATH)],
+            capture_output=True, cwd=BOT_REPO, env=environment, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise ValueError("Evaluation tool failed")
+        report = MemoryEvaluationReport.model_validate_json(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=503, detail="Memory 평가 정보를 조회할 수 없습니다.") from exc
+    return {"evaluation": report.model_dump(mode="json"),
+            "source": source_freshness(BOT_DB_PATH), "checked_at": utc_now()}
 
 
 @app.get("/memory/{item_id}")

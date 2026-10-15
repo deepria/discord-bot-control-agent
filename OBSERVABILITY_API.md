@@ -11,6 +11,14 @@ with bounded reads and never write to the Bot database.
   aggregated answer usage.
 - `GET /memory?scope=channel|owner_private&limit=50&cursor=<id>` returns
   metadata only. It never returns stored memory content.
+- `GET /memory/evaluation` runs the Bot's read-only `rio-memory-eval` module using
+  the configured `RIO_BOT_PYTHON`, `RIO_BOT_REPO`, and `RIO_BOT_DB_PATH`. It returns
+  allowlisted aggregate lifecycle/provenance counts, observation dates, fixed
+  screening thresholds (50 active items / 7 days), source freshness, and check time.
+  It accepts no caller-supplied database path or threshold. The tool has a five-second
+  timeout; unavailable/older Bot installations return a safe 503. No source IDs,
+  owners, memory content, or subprocess diagnostics are returned. Metadata readiness
+  does not enable retrieval or authorize content review.
 - `GET /memory/{item_id}` is an administrator-only metadata read. It requires
   the Console to send `X-Rio-Actor-Id`, `X-Rio-Actor-Timestamp`, and
   `X-Rio-Actor-Signature`. The signature is the lowercase HMAC-SHA256 hex value
