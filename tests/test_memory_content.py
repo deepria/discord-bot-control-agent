@@ -110,3 +110,22 @@ def test_missing_item_or_database_is_not_replaced_with_empty_content(database, m
     monkeypatch.setattr(module, "BOT_DB_PATH", missing)
     assert client.get("/memory/1?include_content=true", headers=identity()).status_code == 503
     assert not missing.exists()
+
+
+@pytest.mark.parametrize("owner,expected", [("99", [1]), ("88", [2]), ("77", [])])
+def test_metadata_owner_filter_is_exact_and_content_free(database, owner, expected):
+    response = client.get("/memory", params={"owner_id": owner}, headers=TOKEN)
+    assert response.status_code == 200
+    rows = response.json()["memory"]
+    assert [r["id"] for r in rows] == expected
+    assert all("content" not in row and row["owner_id"] == owner for row in rows)
+
+
+def test_owner_filter_combines_with_cursor_and_scope(database):
+    response = client.get("/memory?owner_id=99&cursor=1&scope=owner_private", headers=TOKEN)
+    assert response.status_code == 200 and response.json()["memory"] == []
+
+
+@pytest.mark.parametrize("owner", ["99 OR 1=1", "９９", "1" * 31, "-1"])
+def test_owner_filter_rejects_invalid_ids(database, owner):
+    assert client.get("/memory", params={"owner_id": owner}, headers=TOKEN).status_code == 422
