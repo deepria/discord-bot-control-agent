@@ -9,7 +9,7 @@ with bounded reads and never write to the Bot database.
 - `GET /traces/{turn_id}` returns the content-free events for one turn.
 - `GET /analytics/usage?from=<ISO8601>&to=<ISO8601>&group_by=provider` returns
   aggregated answer usage.
-- `GET /memory?scope=channel|owner_private&limit=50&cursor=<id>` returns
+- `GET /memory?scope=channel|owner_private&limit=50&cursor=<id>&owner_id=<user-id>` returns
   metadata only. It never returns stored memory content.
 - `GET /memory/evaluation` runs the Bot's read-only `rio-memory-eval` module using
   the configured `RIO_BOT_PYTHON`, `RIO_BOT_REPO`, and `RIO_BOT_DB_PATH`. It returns
@@ -39,3 +39,5 @@ with bounded reads and never write to the Bot database.
 `RIO_TELEMETRY_MAX_AGE_SECONDS` controls when a readable source becomes stale
 (default 900 seconds). `RIO_JSONL_READ_MAX_BYTES` bounds each JSONL tail read
 (default 1 MiB).
+
+The optional owner_id is an ASCII decimal user ID (1–30 digits), compared exactly using a bound SQL parameter. It composes with disclosure and cursor pagination. It is a metadata filter, not an authorization claim; content remains signed-admin-only.

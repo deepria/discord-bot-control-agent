@@ -356,13 +356,16 @@ def usage_analytics(limit: int, group_by: Literal["provider", "model"], start: d
 
 
 def read_memory_metadata(limit: int, scope: Literal["channel", "owner_private"] | None = None,
-                         cursor: int | None = None) -> tuple[list[dict], str, int | None]:
+                         cursor: int | None = None, owner_id: str | None = None) -> tuple[list[dict], str, int | None]:
     if not BOT_DB_PATH.exists():
         return [], "UNAVAILABLE", None
     try:
         connection = sqlite3.connect(f"file:{BOT_DB_PATH}?mode=ro", uri=True)
         connection.execute("PRAGMA query_only=ON")
         predicates, values = [], []
+        if owner_id is not None:
+            predicates.append("owner_id = ?")
+            values.append(owner_id)
         if scope:
             predicates.append("disclosure = ?")
             values.append(scope)
@@ -1030,10 +1033,11 @@ def memory_list(
     limit: int = Query(default=50, ge=1, le=100),
     scope: Literal["channel", "owner_private"] | None = None,
     cursor: int | None = Query(default=None, ge=1),
+    owner_id: str | None = Query(default=None, pattern=r"^[0-9]{1,30}$"),
     authorization: str | None = Header(default=None),
 ):
     verify_token(authorization)
-    rows, source, next_cursor = read_memory_metadata(limit, scope, cursor)
+    rows, source, next_cursor = read_memory_metadata(limit, scope, cursor, owner_id)
     return {"source": source_freshness(BOT_DB_PATH), "source_status": source,
             "memory": rows, "next_cursor": next_cursor}
 
