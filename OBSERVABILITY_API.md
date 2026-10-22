@@ -41,3 +41,29 @@ with bounded reads and never write to the Bot database.
 (default 1 MiB).
 
 The optional owner_id is an ASCII decimal user ID (1–30 digits), compared exactly using a bound SQL parameter. It composes with disclosure and cursor pagination. It is a metadata filter, not an authorization claim; content remains signed-admin-only.
+
+## Retained telemetry (schema 1)
+
+`RIO_TELEMETRY_DB_PATH` defaults to `/opt/rio-discord-bot/data/telemetry.sqlite3`, the Bot's
+new dedicated store. Agent opens it with mode=ro and query_only, checks its application/schema
+identity, and never expires rows itself. Deploy the Bot writer before this reader.
+
+- `/traces`, `/traces/{turn_id}`: query unexpired 30-day trace, including `turn.usage` call links.
+  Stable `(at, turn_id, event)` cursors and existing response fields are preserved.
+- `/analytics/usage`: up to 90 elapsed days. Keeps existing answer-call count/error/success,
+  known token total, and exact observed p50/p95 semantics; adds `unknown_token_calls`.
+  Discord turn aggregates and provider-call facts are not summed together.
+- `coverage`: mode `retained`/`legacy_tail`, retention_days, collection_started_at,
+  oldest_at/newest_at, truncated, history_limited, cleanup_pending. Bounds describe all
+  currently retained records for that stream, not continuous coverage or a missing-write audit.
+- An absent store falls back to explicit partial legacy-tail results. An invalid/unreadable
+  existing store returns UNAVAILABLE, never a silent legacy success. Old traces remain
+  excluded at read time even if the Bot expiry timer is not installed.
+- Usage reads at most 100,000 samples and enforces a SQLite progress budget. Hitting sample
+  or group caps reports truncated=true; a query-work failure reports UNAVAILABLE. Trace
+  responses are row/byte bounded and paginated. Timestamps require a timezone.
+- Collection starts with the new writer; no old JSONL imports and no claims of a preexisting
+  30/90-day history. Source HEALTHY means the store was readable, not recent user activity.
+
+Install the Bot's hourly expiry timer after reviewing its preview. Existing JSONL, host journals,
+backups and memory are unaffected; no global maximum retention for those copies is asserted.
