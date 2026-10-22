@@ -1,10 +1,13 @@
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+
+os.environ.setdefault("RIO_AGENT_TOKEN", "test-token")
 
 import app as app_module
 import retained_telemetry as reader
