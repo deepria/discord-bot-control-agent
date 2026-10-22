@@ -17,6 +17,8 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from retained_telemetry import legacy_coverage, read_retained
+
 app = FastAPI(title="Rio Agent")
 
 SERVICE = "rio-bot.service"
@@ -45,7 +47,9 @@ MEMORY_AUDIT_PATH = Path(
 )
 TELEMETRY_MAX_AGE_SECONDS = max(60, int(os.getenv("RIO_TELEMETRY_MAX_AGE_SECONDS", "900")))
 JSONL_READ_MAX_BYTES = max(4096, int(os.getenv("RIO_JSONL_READ_MAX_BYTES", "1048576")))
-MAX_QUERY_WINDOW = timedelta(days=31)
+TELEMETRY_DB_PATH = Path(os.getenv(
+    "RIO_TELEMETRY_DB_PATH", str(BOT_DB_PATH.with_name("telemetry.sqlite3"))
+))
 
 
 class DiscordIdentity(BaseModel):
@@ -296,11 +300,13 @@ def encode_cursor(row: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
 
 
-def validate_period(start: datetime | None, end: datetime | None) -> None:
+def validate_period(start: datetime | None, end: datetime | None, *, days: int = 31) -> None:
+    if any(value is not None and value.tzinfo is None for value in (start, end)):
+        raise HTTPException(status_code=422, detail="Timestamps must include a timezone")
     if start and end and start > end:
         raise HTTPException(status_code=422, detail="from must not be after to")
-    if start and end and end - start > MAX_QUERY_WINDOW:
-        raise HTTPException(status_code=422, detail="Requested period exceeds 31 days")
+    if start and end and end - start > timedelta(days=days):
+        raise HTTPException(status_code=422, detail=f"Requested period exceeds {days} days")
 
 
 def within_period(row: dict, start: datetime | None, end: datetime | None) -> bool:
@@ -310,6 +316,8 @@ def within_period(row: dict, start: datetime | None, end: datetime | None) -> bo
     try:
         value = datetime.fromisoformat(at.replace("Z", "+00:00"))
     except ValueError:
+        return False
+    if value.tzinfo is None:
         return False
     return (start is None or value >= start) and (end is None or value <= end)
 
@@ -332,17 +340,23 @@ def traces(turn_id: str | None, limit: int, start: datetime | None = None,
 def usage_analytics(limit: int, group_by: Literal["provider", "model"], start: datetime | None = None,
                     end: datetime | None = None) -> tuple[list[dict], str]:
     rows, source = read_jsonl(USAGE_LOG_PATH, limit * 8)
+    return aggregate_usage(rows, group_by, start, end), source
+
+
+def aggregate_usage(rows, group_by, start=None, end=None):
     groups: dict[str, dict] = {}
     for row in rows:
         if row.get("operation") != "answer" or not within_period(row, start, end):
             continue
         key = str(row.get(group_by) or "unknown")
         group = groups.setdefault(key, {group_by: key, "calls": 0, "errors": 0, "total_tokens": 0,
-                                        "latency_ms": []})
+                                        "latency_ms": [], "unknown_token_calls": 0})
         group["calls"] += 1
         group["errors"] += int(row.get("status") == "error")
         if isinstance(row.get("total_tokens"), int):
             group["total_tokens"] += row["total_tokens"]
+        else:
+            group["unknown_token_calls"] += 1
         if isinstance(row.get("elapsed_ms"), int):
             group["latency_ms"].append(row["elapsed_ms"])
     result = []
@@ -352,7 +366,7 @@ def usage_analytics(limit: int, group_by: Literal["provider", "model"], start: d
         group["p50_latency_ms"] = latency[len(latency) // 2] if latency else None
         group["p95_latency_ms"] = latency[min(len(latency) - 1, int(len(latency) * .95))] if latency else None
         result.append(group)
-    return result, source
+    return result
 
 
 def read_memory_metadata(limit: int, scope: Literal["channel", "owner_private"] | None = None,
@@ -997,20 +1011,39 @@ def trace_list(
 ):
     verify_token(authorization)
     validate_period(from_, to)
+    retained = read_retained(TELEMETRY_DB_PATH, "traces", start=from_, end=to,
+                             after=parse_cursor(cursor), limit=limit)
+    if retained is not None:
+        records = [safe_trace(row) for row in retained["rows"]]
+        page = records[:limit]
+        more = len(records) > limit or retained["coverage"]["truncated"]
+        return {"source": retained["source"], "source_status": retained["source"]["status"],
+                "coverage": retained["coverage"], "traces": page,
+                "next_cursor": encode_cursor(page[-1]) if more and page else None}
     rows, source, next_cursor = traces(None, limit, from_, to, cursor)
     return {"source": source_freshness(EVENT_LOG_PATH), "source_status": source,
-            "traces": rows, "next_cursor": next_cursor}
+            "traces": rows, "next_cursor": next_cursor, "coverage": legacy_coverage("traces")}
 
 
 @app.get("/traces/{turn_id}")
 def trace_detail(turn_id: UUID, authorization: str | None = Header(default=None)):
     verify_token(authorization)
+    retained = read_retained(TELEMETRY_DB_PATH, "traces", turn_id=str(turn_id), limit=100)
+    if retained is not None:
+        if retained["source"]["status"] == "UNAVAILABLE":
+            raise HTTPException(status_code=503, detail="Retained trace source unavailable")
+        records = [safe_trace(row) for row in retained["rows"]]
+        if not records:
+            raise HTTPException(status_code=404, detail="Trace not found in retained period")
+        retained["coverage"]["truncated"] |= len(records) > 100
+        return {"source": retained["source"], "source_status": retained["source"]["status"],
+                "trace": records[:100], "coverage": retained["coverage"]}
     rows, source, _ = traces(str(turn_id), 100)
     if not rows and source == "UNAVAILABLE":
         raise HTTPException(status_code=503, detail="Trace source is unavailable")
     if not rows:
         raise HTTPException(status_code=404, detail="Trace not found")
-    return {"source": source_freshness(EVENT_LOG_PATH), "source_status": source, "trace": rows}
+    return {"source": source_freshness(EVENT_LOG_PATH), "source_status": source, "trace": rows, "coverage": legacy_coverage("traces")}
 
 
 @app.get("/analytics/usage")
@@ -1022,10 +1055,16 @@ def analytics_usage(
     authorization: str | None = Header(default=None),
 ):
     verify_token(authorization)
-    validate_period(from_, to)
+    validate_period(from_, to, days=90)
+    retained = read_retained(TELEMETRY_DB_PATH, "usage", start=from_, end=to)
+    if retained is not None:
+        groups = aggregate_usage(retained["rows"], group_by)
+        retained["coverage"]["truncated"] |= len(groups) > limit
+        return {"source": retained["source"], "source_status": retained["source"]["status"],
+                "coverage": retained["coverage"], "group_by": group_by, "groups": groups[:limit]}
     rows, source = usage_analytics(limit, group_by, from_, to)
     return {"source": source_freshness(USAGE_LOG_PATH), "source_status": source,
-            "group_by": group_by, "groups": rows}
+            "group_by": group_by, "groups": rows, "coverage": legacy_coverage("usage")}
 
 
 @app.get("/memory")
